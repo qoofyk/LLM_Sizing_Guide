@@ -9,6 +9,9 @@ class GPUSpec:
     fp16_tflops: float
     memory_gb: int
     memory_bandwidth_gbps: int
+    # Fraction of peak memory bandwidth achieved during decode. 1.0 keeps the
+    # original (theoretical) calculation; CPU devices use a calibrated value.
+    bw_efficiency: float = 1.0
 
 # Use your specific GPUs here
 GPU_SPECS: List[GPUSpec] = [
@@ -20,6 +23,18 @@ GPU_SPECS: List[GPUSpec] = [
     # GPUSpec("H200 SXM", 989.5, 141, 4800),
     GPUSpec("H200 NVL", 835.5, 141, 4800),
     GPUSpec("MI300X", 1307, 192, 5300)
+]
+
+# GPUs relevant to VIA sizing, from entry-level PCIe cards to 8-GPU HGX nodes.
+VIA_GPU_SPECS: List[GPUSpec] = [
+    GPUSpec("L4", 121, 24, 300),
+    GPUSpec("L40s", 362, 48, 864),
+    GPUSpec("A100 80GB SXM", 312, 80, 2039),
+    GPUSpec("H100 SXM", 989.5, 80, 3350),
+    GPUSpec("H100 NVL", 835.5, 94, 3900),
+    GPUSpec("H200 SXM", 989.5, 141, 4800),
+    GPUSpec("B200", 2250, 180, 8000),
+    GPUSpec("B300", 2250, 288, 8000),
 ]
 
 # Commented out GPUs for reference

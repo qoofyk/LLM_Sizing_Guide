@@ -35,17 +35,21 @@ class PerformanceReporter:
         response_size: int,
         n_concurrent_request: int,
         kv_cache_size_per_token: float,
-        memory_footprint: float
+        memory_footprint: float,
+        weight_gb: float = None
     ) -> Dict[str, Any]:
         """Format a row for memory footprint report."""
-        return {
+        row = {
             'Model': model_name,
             'Input Size (tokens)': prompt_size,
             'Output Size (tokens)': response_size,
             'Concurrent Requests': n_concurrent_request,
             'KV Cache Size per Token': f"{kv_cache_size_per_token:.6f} GiB/token",
-            'Memory Footprint': f"{memory_footprint:.2f} GB"
         }
+        if weight_gb is not None:
+            row['Weights'] = f"{weight_gb:.1f} GB"
+        row['Memory Footprint'] = f"{memory_footprint:.2f} GB"
+        return row
 
     @staticmethod
     def format_performance_row(
@@ -68,5 +72,6 @@ class PerformanceReporter:
             'TPOT (ms)': f"{metrics.tpot:.3f} ms" if isinstance(metrics.tpot, float) else metrics.tpot,
             'TTFT': f"{metrics.ttft:.3f} s" if isinstance(metrics.ttft, float) else metrics.ttft,
             'E2E Latency': f"{metrics.e2e_latency:.1f} s" if isinstance(metrics.e2e_latency, float) else metrics.e2e_latency,
-            'Output Tokens Throughput': f"{metrics.throughput:.2f} tokens/sec" if isinstance(metrics.throughput, float) else metrics.throughput
+            'Output Tokens Throughput': f"{metrics.throughput:.2f} tokens/sec" if isinstance(metrics.throughput, float) else metrics.throughput,
+            'Max Concurrent Req': str(metrics.max_concurrent_requests)
         }
