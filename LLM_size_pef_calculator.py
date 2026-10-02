@@ -11,7 +11,7 @@ import argparse
 from typing import List, Dict, Any
 
 from configs.gpu_specs import GPU_SPECS, VIA_GPU_SPECS, GPUSpec
-from configs.cpu_specs import CPU_SPECS
+from configs.cpu_specs import CPU_SPECS, CPUSpec
 from configs.model_specs import MODEL_SPECS, VIA_MODEL_SPECS, ALL_MODEL_SPECS, ModelSpec
 from llm_calculator.performance import PerformanceCalculator
 from llm_calculator.reporting import PerformanceReporter
@@ -62,7 +62,17 @@ def parse_args() -> argparse.Namespace:
         type=str, default=None,
         help='Comma-separated substrings to filter GPUs/CPUs, e.g. "H100,B200"'
     )
+    parser.add_argument(
+        '--efficiency',
+        choices=['theoretical', 'calibrated'], default=None,
+        help='GPU efficiency model: theoretical peak (default) or calibrated against '
+             'published batch-1 measurements (default with --profile via). '
+             'CPU devices always use calibrated values.'
+    )
     args = parser.parse_args()
+
+    if args.efficiency is None:
+        args.efficiency = 'calibrated' if args.profile == 'via' else 'theoretical'
 
     defaults = (16000, 512, 4) if args.profile == 'via' else (4096, 256, 10)
     if args.prompt_sz is None:
@@ -184,6 +194,9 @@ def calculate_performance_metrics(
                 n_concurrent_request,
                 metrics
             )
+            if isinstance(gpu, CPUSpec):
+                # Which CPU kernel path the estimate assumes for this model
+                row['Accel'] = 'AMX' if calculator.uses_amx(model, gpu) else 'AVX-512'
             performance_table.append(row)
     
     return performance_table
@@ -195,11 +208,12 @@ def main() -> None:
     print(f" num_gpu = {args.num_gpu}, prompt_size = {args.prompt_sz} tokens, "
           f"response_size = {args.response_sz} tokens")
     print(f" n_concurrent_request = {args.n_concurrent_req}, profile = {args.profile}, "
-          f"device = {args.device}")
+          f"device = {args.device}, efficiency = {args.efficiency}")
 
     models, devices = select_models_and_devices(args)
 
-    calculator = PerformanceCalculator(args.num_gpu)
+    calculator = PerformanceCalculator(args.num_gpu,
+                                       calibrated=(args.efficiency == 'calibrated'))
     reporter = PerformanceReporter()
 
     # Calculate and report memory footprint

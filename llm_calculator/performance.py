@@ -1,11 +1,24 @@
 """Performance calculation utilities for LLM inference."""
 
 from dataclasses import dataclass
-from typing import Union, Optional
+from typing import Tuple, Union, Optional
+from configs.cpu_specs import CPUSpec, CPU_BW_EFFICIENCY
 from configs.gpu_specs import GPUSpec
 from configs.model_specs import ModelSpec
 
 BYTES_IN_GiB = 1_073_741_824
+
+# Calibrated GPU model for batch-1 inference, fitted to public measurements
+# (see validation/sanity_check.py for every data point and its source):
+#   TPOT    = active weight bytes / (peak BW x bandwidth eff.) + fixed overhead
+#   prefill = 2 x active params / (dense peak FLOPS x compute eff.)
+# Small-active MoE models (gpt-oss) pay a fixed per-token cost (routing, many small
+# kernels) that dominates on fast GPUs, so a bandwidth-only formula overstates them.
+GPU_CALIBRATION = {
+    #         compute eff., bandwidth eff., overhead per output token (ms)
+    "dense": {"compute": 0.38, "bandwidth": 0.70, "overhead_ms": 0.5},
+    "moe":   {"compute": 0.15, "bandwidth": 0.50, "overhead_ms": 2.0},
+}
 
 @dataclass
 class PerformanceMetrics:
@@ -20,8 +33,33 @@ class PerformanceMetrics:
 class PerformanceCalculator:
     """Calculator for LLM inference performance metrics."""
 
-    def __init__(self, num_gpu: int):
+    def __init__(self, num_gpu: int, calibrated: bool = False):
         self.num_gpu = num_gpu
+        self.calibrated = calibrated
+
+    def uses_amx(self, model: ModelSpec, device: GPUSpec) -> bool:
+        return isinstance(device, CPUSpec) and device.amx and model.amx_eligible
+
+    def effective_rates(self, model: ModelSpec, device: GPUSpec) -> Tuple[float, float]:
+        """Return (effective TFLOPS, effective GB/s) for this model on this device."""
+        model_class = "moe" if model.is_moe else "dense"
+        if isinstance(device, CPUSpec):
+            # CPU values are always effective (calibrated) numbers.
+            tflops = device.amx_tflops if self.uses_amx(model, device) else device.fp16_tflops
+            return tflops, device.memory_bandwidth_gbps * CPU_BW_EFFICIENCY[model_class]
+        tflops = device.fp16_tflops
+        bw = device.memory_bandwidth_gbps * device.bw_efficiency
+        if self.calibrated:
+            cal = GPU_CALIBRATION[model_class]
+            tflops *= cal["compute"]
+            bw *= cal["bandwidth"]
+        return tflops, bw
+
+    def decode_overhead_ms(self, model: ModelSpec, device: GPUSpec) -> float:
+        """Fixed per-output-token cost (calibrated GPU mode only)."""
+        if self.calibrated and not isinstance(device, CPUSpec):
+            return GPU_CALIBRATION["moe" if model.is_moe else "dense"]["overhead_ms"]
+        return 0.0
 
     def calc_kv_cache_size_per_token(self, model: ModelSpec) -> float:
         """Calculate KV cache size per token in GiB."""
@@ -54,15 +92,17 @@ class PerformanceCalculator:
                                   model: ModelSpec,
                                   gpu: GPUSpec) -> Union[float, str]:
         """Calculate prefill time per token in milliseconds."""
-        result = (2 * model.active_params / self.num_gpu) / gpu.fp16_tflops
+        tflops, _ = self.effective_rates(model, gpu)
+        result = (2 * model.active_params / self.num_gpu) / tflops
         return result if result >= 0 else "OOM"
 
     def calc_tpot(self,
                  model: ModelSpec,
                  gpu: GPUSpec) -> Union[float, str]:
         """Calculate token processing time (TPOT) in milliseconds."""
-        effective_bw = gpu.memory_bandwidth_gbps * gpu.bw_efficiency
-        result = (model.active_weight_gb / self.num_gpu) / effective_bw * 1000
+        _, effective_bw = self.effective_rates(model, gpu)
+        result = ((model.active_weight_gb / self.num_gpu) / effective_bw * 1000 +
+                  self.decode_overhead_ms(model, gpu))
         return result if result >= 0 else "OOM"
 
     def calc_e2e_latency(self,
