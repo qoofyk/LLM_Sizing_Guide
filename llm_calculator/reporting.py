@@ -9,6 +9,24 @@ class PerformanceReporter:
     """Reporter class for generating and saving performance reports."""
 
     @staticmethod
+    def print_estimate_notes(efficiency: str, device: str) -> None:
+        """Explain the effective estimation mode and scope of the output rates."""
+        if device == 'cpu':
+            print("Estimate mode: calibrated CPU rates (always used for CPU devices).")
+        elif efficiency == 'theoretical':
+            print("Estimate mode: theoretical (idealized hardware estimate).")
+        else:
+            print("Estimate mode: calibrated (historical factors; not refitted to corrected work estimates).")
+        if device == 'cpu':
+            print("CPU efficiency factors are unchanged and have not been refitted to corrected work estimates.")
+        print("Single-request output rate includes prefill; single-stream decode rate "
+              "excludes prefill. Neither rate represents aggregate serving capacity.")
+        print("Concurrency affects memory sizing only; Max Concurrent Req is a "
+              "memory limit, not a latency target.")
+        print("TPOT uses midpoint decode context. Attention/cache/state work is estimated; "
+              "batching, prefix reuse, speculative decoding and queueing are not modeled.")
+
+    @staticmethod
     def save_to_csv(data: List[Dict[str, Any]], filename_prefix: str) -> str:
         """Save data to CSV file with timestamp."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -72,6 +90,8 @@ class PerformanceReporter:
             'TPOT (ms)': f"{metrics.tpot:.3f} ms" if isinstance(metrics.tpot, float) else metrics.tpot,
             'TTFT': f"{metrics.ttft:.3f} s" if isinstance(metrics.ttft, float) else metrics.ttft,
             'E2E Latency': f"{metrics.e2e_latency:.1f} s" if isinstance(metrics.e2e_latency, float) else metrics.e2e_latency,
-            'Output Tokens Throughput': f"{metrics.throughput:.2f} tokens/sec" if isinstance(metrics.throughput, float) else metrics.throughput,
-            'Max Concurrent Req': str(metrics.max_concurrent_requests)
+            'Single-request output rate': f"{metrics.throughput:.2f} tokens/sec" if isinstance(metrics.throughput, float) else metrics.throughput,
+            'Single-stream decode rate': f"{metrics.decode_throughput:.2f} tokens/sec" if isinstance(metrics.decode_throughput, float) else metrics.decode_throughput,
+            'Max Concurrent Req': str(metrics.max_concurrent_requests),
+            'Status': metrics.status
         }

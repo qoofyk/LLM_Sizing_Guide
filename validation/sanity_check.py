@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tabulate import tabulate  # noqa: E402
 from configs.cpu_specs import cpu  # noqa: E402
 from configs.gpu_specs import GPUSpec  # noqa: E402
-from configs.model_specs import ModelSpec  # noqa: E402
+from configs.model_specs import ModelSpec, VIA_MODEL_SPECS  # noqa: E402
 from llm_calculator.performance import PerformanceCalculator  # noqa: E402
 
 def m(name, params, precision, weight_gb, active=None):
@@ -42,8 +42,9 @@ class Anchor:
     measured: float
     source: str
 
-GPT_OSS_20B = m("gpt-oss-20b", 20.9, "MXFP4", 13.0, active=3.6)
-GPT_OSS_120B = m("gpt-oss-120b", 116.8, "MXFP4", 63.0, active=5.1)
+# Exercise the actual mixed-precision catalog instead of synthetic MoE entries.
+GPT_OSS_20B = next(m for m in VIA_MODEL_SPECS if m.name == "gpt-oss-20b")
+GPT_OSS_120B = next(m for m in VIA_MODEL_SPECS if m.name == "gpt-oss-120b")
 
 L40S = GPUSpec("L40s", 362, 48, 864)
 VIA_LIKE_PROMPT = 13_000   # devforth.io used ~10k-word prompts (~13k tokens)
@@ -105,10 +106,13 @@ def estimate(a: Anchor) -> float:
     if a.metric == "decode":
         return 1000 / tpot
     if a.metric == "ttft_s":
-        return (VIA_LIKE_PROMPT * prefill + tpot) / 1000
+        return calc.calculate_metrics(a.model, a.device, VIA_LIKE_PROMPT, 128).ttft
     return 1000 / prefill
 
 def main() -> None:
+    print("Historical calibration factors were not refitted after the formula corrections.")
+    print("Decode/prefill anchors without prompt metadata use context-free projection/weight estimates;")
+    print("they do not validate long-context attention, parallelism, or serving throughput.")
     rows = []
     for a in ANCHORS:
         est = estimate(a)

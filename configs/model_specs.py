@@ -28,6 +28,18 @@ class ModelSpec:
     kv_dtype_bytes: float = 2.0                     # FP16 KV=2, FP8 KV=1
     kv_bytes_per_token_override: Optional[float] = None  # MLA/DSA/KDA caches
     state_gb_per_request: float = 0.0               # fixed recurrent state (linear attention)
+    active_weight_gb_override: Optional[float] = None  # decimal GB, selected matrices
+    low_precision_params_billion: Optional[float] = None
+    attention_type: str = "gqa"                    # gqa, mla, or dsa
+    attention_key_dim: Optional[int] = None
+    attention_value_dim: Optional[int] = None
+    sliding_window: int = 0
+    sliding_layers: int = 0
+    sparse_top_k: int = 0
+    indexer_layers: int = 0
+    indexer_heads: int = 0
+    indexer_dim: int = 0
+    indexer_bytes_per_token: float = 0.0
 
     @property
     def label(self) -> str:
@@ -53,8 +65,43 @@ class ModelSpec:
 
     @property
     def active_weight_gb(self) -> float:
-        """GB of weights read per decoded token (scaled by the average bytes/param)."""
+        """Decimal GB of selected weights, with mixed-precision overrides."""
+        if self.active_weight_gb_override is not None:
+            return self.active_weight_gb_override
         return self.active_params * self.weight_gb / self.params_billion
+
+
+def gpt_oss_active_weights(layers: int, experts: int) -> float:
+    """Selected MXFP4 matrices plus BF16 attention/router/output matrices, GB.
+
+    openai/gpt-oss config.json and github.com/openai/gpt-oss#precision-format:
+    32 FP4 values + one scale byte per block. Small biases/norms are omitted.
+    The embedding lookup reads one row, not the whole embedding matrix.
+    """
+    expert_params = layers * 4 * 3 * 2880 * 2880
+    attention_params = layers * 2880 * (2 * 64 + 2 * 8) * 64
+    router_params = layers * 2880 * experts
+    output_params = 2880 * 201088
+    return (expert_params * (0.5 + 1 / 32) +
+            2 * (attention_params + router_params + output_params + 2880)) / 1e9
+
+
+# Config-derived approximations: selected routed matrices at their stored
+# precision, with the remaining rounded active-parameter count at BF16.
+# Sources: moonshotai/Kimi-K3 and nvidia/GLM-5.2-NVFP4 config.json on Hugging Face.
+KIMI_ROUTED_ACTIVE_B = 92 * 16 * 3 * 3584 * 3072 / 1e9
+GLM_ROUTED_ACTIVE_B = 75 * 8 * 3 * 6144 * 2048 / 1e9
+KIMI_ACTIVE_GB = KIMI_ROUTED_ACTIVE_B * (0.5 + 1 / 32) + (104 - KIMI_ROUTED_ACTIVE_B) * 2
+GLM_NVFP4_ACTIVE_GB = GLM_ROUTED_ACTIVE_B * (0.5 + 1 / 16) + (40 - GLM_ROUTED_ACTIVE_B) * 2
+# FP8 checkpoint: matrix weights use FP8 with FP32 scales per 128x128 block;
+# output head and router remain higher precision. Small excluded tensors omitted.
+GLM_BF16_ACTIVE_B = (6144 * 154880 + 75 * 6144 * 256) / 1e9
+GLM_FP8_ACTIVE_GB = (40 - GLM_BF16_ACTIVE_B) * (1 + 4 / 128**2) + GLM_BF16_ACTIVE_B * 2
+
+GLM_ATTENTION = dict(attention_type="dsa", n_kv_layers=78,
+                     attention_key_dim=576, attention_value_dim=512,
+                     sparse_top_k=2048, indexer_layers=21, indexer_heads=32,
+                     indexer_dim=128, indexer_bytes_per_token=21 * 132)
 
 MODEL_SPECS: List[ModelSpec] = [
     ModelSpec(
@@ -79,10 +126,16 @@ VIA_MODEL_SPECS: List[ModelSpec] = [
     # window, so only half the layers grow KV with context.
     ModelSpec("gpt-oss-20b", 20.9, 2880, 64, 8, 24, 131072,
               precision="MXFP4", active_params_billion=3.6,
-              weight_gb_override=13.0, n_kv_layers=12, head_dim=64),
+              weight_gb_override=13.0, n_kv_layers=12, head_dim=64,
+              active_weight_gb_override=gpt_oss_active_weights(24, 32),
+              low_precision_params_billion=24 * 4 * 3 * 2880**2 / 1e9,
+              sliding_window=128, sliding_layers=12),
     ModelSpec("gpt-oss-120b", 116.8, 2880, 64, 8, 36, 131072,
               precision="MXFP4", active_params_billion=5.1,
-              weight_gb_override=63.0, n_kv_layers=18, head_dim=64),
+              weight_gb_override=63.0, n_kv_layers=18, head_dim=64,
+              active_weight_gb_override=gpt_oss_active_weights(36, 128),
+              low_precision_params_billion=36 * 4 * 3 * 2880**2 / 1e9,
+              sliding_window=128, sliding_layers=18),
     # Qwen3.5-9B / Qwen3.8-27B: 3 Gated DeltaNet (linear) : 1 gated full-attention
     # layer; only the full-attention layers keep KV. Linear layers keep a fixed state.
     ModelSpec("Qwen3.5-9B", 9.0, 4096, 16, 4, 32, 262144,
@@ -102,16 +155,22 @@ VIA_MODEL_SPECS: List[ModelSpec] = [
               n_kv_layers=16, head_dim=256, state_gb_per_request=0.15),
     # GLM-5.2: MoE 744B/40B active with DeepSeek Sparse Attention (MLA-based).
     # config.json: 78 layers, kv_lora_rank 512 + qk_rope 64 per layer; the DSA
-    # indexer (128-dim key) is "full" on 20 layers and shared on the rest.
-    # FP8 KV: 78 x 576 B + 20 x ~132 B ~= 47.6 KB/token (layout is vLLM's, estimate).
+    # indexer (128-dim key) is "full" on 21 layers and shared on the rest.
+    # FP8 KV: 78 x 576 B + 21 x ~132 B = 47.7 KB/token (layout estimate).
     ModelSpec("GLM-5.2", 744, 6144, 64, 1, 78, 1048576,
               precision="FP8", active_params_billion=40,
               weight_gb_override=756, kv_dtype_bytes=1,
-              kv_bytes_per_token_override=47_600),
+              kv_bytes_per_token_override=47_700,
+              active_weight_gb_override=GLM_FP8_ACTIVE_GB,
+              low_precision_params_billion=40 - GLM_BF16_ACTIVE_B,
+              **GLM_ATTENTION),
     ModelSpec("GLM-5.2", 744, 6144, 64, 1, 78, 1048576,
               precision="NVFP4", active_params_billion=40,
               weight_gb_override=440, kv_dtype_bytes=1,
-              kv_bytes_per_token_override=47_600),
+              kv_bytes_per_token_override=47_700,
+              active_weight_gb_override=GLM_NVFP4_ACTIVE_GB,
+              low_precision_params_billion=GLM_ROUTED_ACTIVE_B,
+              **GLM_ATTENTION),
     # Kimi-K3: MoE 2.8T (16 of 896 experts), official 104B active, MXFP4 checkpoint
     # of 1,561 GB (attention/shared experts stay BF16). config.json: 93 layers =
     # 69 KDA (linear) + 24 MLA. Only MLA layers grow KV: 24 x 576 x 2 B = 27.6 KB/token.
@@ -119,7 +178,11 @@ VIA_MODEL_SPECS: List[ModelSpec] = [
     ModelSpec("Kimi-K3", 2800, 7168, 96, 1, 93, 1048576,
               precision="MXFP4", active_params_billion=104,
               weight_gb_override=1561,
-              kv_bytes_per_token_override=27_648, state_gb_per_request=0.43),
+              kv_bytes_per_token_override=27_648, state_gb_per_request=0.43,
+              active_weight_gb_override=KIMI_ACTIVE_GB,
+              low_precision_params_billion=KIMI_ROUTED_ACTIVE_B,
+              attention_type="mla", n_kv_layers=24,
+              attention_key_dim=576, attention_value_dim=512),
 ]
 
 ALL_MODEL_SPECS: List[ModelSpec] = MODEL_SPECS + VIA_MODEL_SPECS

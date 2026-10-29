@@ -39,7 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '-c', '--n_concurrent_req',
         type=int, default=None,
-        help='Number of concurrent requests (default 10; 4 with --profile via)'
+        help='Number of concurrent requests for memory sizing only '
+             '(default 10; 4 with --profile via)'
     )
     parser.add_argument(
         '--profile',
@@ -64,15 +65,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--efficiency',
-        choices=['theoretical', 'calibrated'], default=None,
-        help='GPU efficiency model: theoretical peak (default) or calibrated against '
-             'published batch-1 measurements (default with --profile via). '
-             'CPU devices always use calibrated values.'
+        choices=['theoretical', 'calibrated'], default='theoretical',
+        help='GPU efficiency model: theoretical (idealized hardware estimate; '
+             'default for all GPU profiles) or calibrated using historical factors '
+             'not refitted to the corrected formulas. CPU devices always report calibrated '
+             'values, regardless of this option.'
     )
+    parser.add_argument('--parallelism', choices=['ideal', 'tensor'], default='ideal',
+                        help='ideal: pooled hardware with zero communication; tensor: '
+                             'balanced TP with two ring all-reduces per layer')
+    parser.add_argument('--interconnect-gbps', type=float,
+                        help='One-way usable link bandwidth per GPU in GB/s; required for multi-GPU tensor mode')
+    parser.add_argument('--collective-latency-us', type=float, default=0.0,
+                        help='Latency per all-reduce in microseconds; default 0 is an ideal lower-bound assumption')
+    parser.add_argument('--memory-utilization', type=float, default=1.0,
+                        help='Fraction of device memory available to weights/cache/state (default 1; use e.g. 0.9 for reserve)')
+    parser.add_argument('--compute-precision', choices=['bf16', 'fp8', 'fp4'], default='bf16',
+                        help='Assumed matrix kernel precision, independently of weight storage; '
+                             'default bf16. Low-precision peaks apply only to eligible matrix components')
+    parser.add_argument('--kv-cache-sharding', choices=['auto', 'sharded', 'replicated'], default='auto',
+                        help='auto: pooled in ideal mode; TP replicates MLA/DSA cache and partitions GQA heads. '
+                             'sharded assumes an engine with cache/context parallelism')
     args = parser.parse_args()
 
-    if args.efficiency is None:
-        args.efficiency = 'calibrated' if args.profile == 'via' else 'theoretical'
+    if args.device == 'cpu':
+        args.efficiency = 'calibrated'
 
     defaults = (16000, 512, 4) if args.profile == 'via' else (4096, 256, 10)
     if args.prompt_sz is None:
@@ -81,7 +98,27 @@ def parse_args() -> argparse.Namespace:
         args.response_sz = defaults[1]
     if args.n_concurrent_req is None:
         args.n_concurrent_req = defaults[2]
+    for name in ('num_gpu', 'prompt_sz', 'response_sz', 'n_concurrent_req'):
+        if getattr(args, name) < 1:
+            parser.error(f'{name} must be positive')
+    try:
+        make_calculator(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.device == 'cpu' and (args.num_gpu != 1 or args.parallelism != 'ideal' or
+                                 args.compute_precision != 'bf16' or args.kv_cache_sharding != 'auto'):
+        parser.error('CPU sizing supports one VM (-g 1), ideal parallelism, auto KV sharding and effective bf16 compute')
     return args
+
+
+def make_calculator(args: argparse.Namespace) -> PerformanceCalculator:
+    """Build the calculator with the assumptions printed in each report."""
+    return PerformanceCalculator(
+        args.num_gpu, calibrated=(args.efficiency == 'calibrated'),
+        parallelism=args.parallelism, interconnect_gbps=args.interconnect_gbps,
+        collective_latency_us=args.collective_latency_us,
+        memory_utilization=args.memory_utilization,
+        compute_precision=args.compute_precision, kv_cache_sharding=args.kv_cache_sharding)
 
 def filter_by_name(items: List[Any], pattern: str, name_of) -> List[Any]:
     """Keep items whose name contains any of the comma-separated substrings."""
@@ -113,31 +150,14 @@ def check_memory_requirements(
     n_concurrent_request: int
 ) -> None:
     """Check if memory requirements can be met and print warnings if not."""
-    context_window = prompt_size + response_size
-    memory_footprint = calculator.calc_memory_footprint(
-        model, n_concurrent_request, context_window
-    )
-    available_memory = calculator.num_gpu * gpu.memory_gb
-
-    if model.weight_gb >= available_memory:
-        print(f"\n!!!! Warning {model.label}: weights ({model.weight_gb:.0f} GB) do not fit "
-              f"in {calculator.num_gpu}x {gpu.name} ({available_memory:.0f} GB)")
-        return
-
-    if memory_footprint > available_memory:
-        print(f"\n!!!! Warning {model.label}: n_concurrent_request={n_concurrent_request} "
-              f"is TOO Large!!!\nCausing OOM with ISL={prompt_size} and OSL={response_size} "
-              f"using {calculator.num_gpu}x {gpu.name}")
-        
-        kv_cache_size_per_token = calculator.calc_kv_cache_size_per_token(model)
-        kv_cache_tokens = calculator.calc_kv_cache_tokens(
-            gpu, model, kv_cache_size_per_token
-        )
-        max_n_concurrent_req = int(kv_cache_tokens // context_window)
-        
-        print(f"Max number of concurrent requests that can be set for this use case: "
-              f"{max_n_concurrent_req}\nIgnore the rows in the following table which "
-              f"contains {gpu.name} and rerun the calculator with this number")
+    metrics = calculator.calculate_metrics(model, gpu, prompt_size, response_size,
+                                           n_concurrent_request)
+    if metrics.status != 'OK':
+        print(f"\nWarning {model.label} on {calculator.num_gpu}x {gpu.name}: {metrics.status}.")
+        if metrics.status.startswith('OOM'):
+            print(f"Memory limit for this context: {metrics.max_concurrent_requests} concurrent requests.")
+            if metrics.max_concurrent_requests == 0:
+                print("Even one request does not fit; use more memory or a shorter supported context.")
 
 def calculate_memory_footprint(
     calculator: PerformanceCalculator,
@@ -183,7 +203,7 @@ def calculate_performance_metrics(
     for model in models:
         for gpu in gpus:
             metrics = calculator.calculate_metrics(
-                model, gpu, prompt_size, response_size
+                model, gpu, prompt_size, response_size, n_concurrent_request
             )
             
             row = PerformanceReporter.format_performance_row(
@@ -212,9 +232,18 @@ def main() -> None:
 
     models, devices = select_models_and_devices(args)
 
-    calculator = PerformanceCalculator(args.num_gpu,
-                                       calibrated=(args.efficiency == 'calibrated'))
+    if not models or not devices:
+        raise SystemExit('No matching models or devices. Check --profile, --models and --devices.')
+    calculator = make_calculator(args)
     reporter = PerformanceReporter()
+    reporter.print_estimate_notes(args.efficiency, args.device)
+    print(f"Assumptions: parallelism={args.parallelism}, compute={args.compute_precision}, "
+          f"memory utilization={args.memory_utilization:g}, KV sharding={args.kv_cache_sharding}.")
+    if args.parallelism == 'tensor':
+        print(f"Tensor link: {args.interconnect_gbps} GB/s one-way per GPU; "
+              f"all-reduce latency={args.collective_latency_us:g} us; two collectives/layer, no overlap.")
+    elif args.num_gpu > 1:
+        print("Ideal pooling assumes perfect partitioning and zero communication; it is not a deployment topology.")
 
     # Calculate and report memory footprint
     memory_footprint_table = calculate_memory_footprint(
