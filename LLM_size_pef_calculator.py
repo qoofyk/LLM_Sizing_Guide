@@ -73,13 +73,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--parallelism', choices=['ideal', 'tensor'], default='ideal',
                         help='ideal: pooled hardware with zero communication; tensor: '
-                             'balanced TP with two ring all-reduces per layer')
+                             'balanced TP with two ring all-reduces per layer '
+                             '(expert parallelism and all-to-all are not modeled)')
     parser.add_argument('--interconnect-gbps', type=float,
                         help='One-way usable link bandwidth per GPU in GB/s; required for multi-GPU tensor mode')
-    parser.add_argument('--collective-latency-us', type=float, default=0.0,
-                        help='Latency per all-reduce in microseconds; default 0 is an ideal lower-bound assumption')
-    parser.add_argument('--memory-utilization', type=float, default=1.0,
-                        help='Fraction of device memory available to weights/cache/state (default 1; use e.g. 0.9 for reserve)')
+    parser.add_argument('--collective-latency-us', type=float, default=None,
+                        help='Latency per all-reduce in microseconds; required with --interconnect-gbps '
+                             'for multi-GPU tensor mode. 0 is only a lower bound; 10 is an illustrative '
+                             'assumption, not measured hardware latency')
+    parser.add_argument('--memory-utilization', type=float, default=None,
+                        help='Fraction of device memory available for weights/cache/state. Default: 0.9 '
+                             'for --profile via GPU runs (10%% runtime reserve), otherwise 1.0. '
+                             'An explicit value always overrides the default')
     parser.add_argument('--compute-precision', choices=['bf16', 'fp8', 'fp4'], default='bf16',
                         help='Assumed matrix kernel precision, independently of weight storage; '
                              'default bf16. Low-precision peaks apply only to eligible matrix components')
@@ -90,6 +95,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.device == 'cpu':
         args.efficiency = 'calibrated'
+    args.memory_utilization_explicit = args.memory_utilization is not None
+    if args.memory_utilization is None:
+        args.memory_utilization = 0.9 if args.profile == 'via' and args.device == 'gpu' else 1.0
 
     defaults = (16000, 512, 4) if args.profile == 'via' else (4096, 256, 10)
     if args.prompt_sz is None:
@@ -239,9 +247,20 @@ def main() -> None:
     reporter.print_estimate_notes(args.efficiency, args.device)
     print(f"Assumptions: parallelism={args.parallelism}, compute={args.compute_precision}, "
           f"memory utilization={args.memory_utilization:g}, KV sharding={args.kv_cache_sharding}.")
-    if args.parallelism == 'tensor':
+    reserve = 1 - args.memory_utilization
+    origin = 'explicit' if args.memory_utilization_explicit else 'profile default'
+    print(f"Memory reserve: {reserve:.0%} of device memory ({origin}). The memory-footprint table "
+          f"excludes the reserve; Max Concurrent Req and OOM decisions apply it. Latency is unchanged "
+          f"for workloads that fit.")
+    if args.parallelism == 'tensor' and args.num_gpu > 1:
         print(f"Tensor link: {args.interconnect_gbps} GB/s one-way per GPU; "
               f"all-reduce latency={args.collective_latency_us:g} us; two collectives/layer, no overlap.")
+        if args.collective_latency_us == 0:
+            print("Warning: zero collective latency is a lower bound, not a deployment estimate.")
+        print("Expert parallelism and all-to-all communication are not modeled.")
+    elif args.parallelism == 'tensor':
+        print("Tensor mode with one GPU has no communication. Expert parallelism and all-to-all "
+              "communication are not modeled.")
     elif args.num_gpu > 1:
         print("Ideal pooling assumes perfect partitioning and zero communication; it is not a deployment topology.")
 

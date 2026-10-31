@@ -41,12 +41,14 @@ class PerformanceCalculator:
 
     ideal: perfectly balanced, pooled devices, no communication cost.
     tensor: balanced weights, two ring all-reduces per layer, explicit link
-    bandwidth/latency, and architecture-dependent KV replication.
+    bandwidth/latency (both required for more than one GPU), and
+    architecture-dependent KV replication. Expert parallelism and all-to-all
+    communication are not modeled.
     """
 
     def __init__(self, num_gpu: int, calibrated: bool = False,
                  parallelism: str = "ideal", interconnect_gbps: Optional[float] = None,
-                 collective_latency_us: float = 0.0, memory_utilization: float = 1.0,
+                 collective_latency_us: Optional[float] = None, memory_utilization: float = 1.0,
                  compute_precision: str = "bf16", kv_cache_sharding: str = "auto"):
         if num_gpu < 1:
             raise ValueError("num_gpu must be positive")
@@ -58,12 +60,17 @@ class PerformanceCalculator:
             raise ValueError("kv_cache_sharding must be auto, sharded, or replicated")
         if not math.isfinite(memory_utilization) or not 0 < memory_utilization <= 1:
             raise ValueError("memory_utilization must be in (0, 1]")
-        if not math.isfinite(collective_latency_us) or collective_latency_us < 0:
+        if collective_latency_us is not None and (
+                not math.isfinite(collective_latency_us) or collective_latency_us < 0):
             raise ValueError("collective_latency_us must be finite and nonnegative")
         if interconnect_gbps is not None and (not math.isfinite(interconnect_gbps) or interconnect_gbps <= 0):
             raise ValueError("interconnect_gbps must be finite and positive")
-        if parallelism == "tensor" and num_gpu > 1 and interconnect_gbps is None:
-            raise ValueError("tensor parallelism requires --interconnect-gbps (one-way GB/s per GPU)")
+        if parallelism == "tensor" and num_gpu > 1:
+            if interconnect_gbps is None:
+                raise ValueError("tensor parallelism requires --interconnect-gbps (one-way GB/s per GPU)")
+            if collective_latency_us is None:
+                raise ValueError("tensor parallelism requires --collective-latency-us per all-reduce "
+                                 "(0 is only a lower bound; 10 is an illustrative value, not measured)")
         self.num_gpu = num_gpu
         self.calibrated = calibrated
         self.parallelism = parallelism
