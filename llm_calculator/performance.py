@@ -11,11 +11,15 @@ from configs.model_specs import ModelSpec
 BYTES_IN_GiB = 1_073_741_824
 BYTES_IN_GB = 1_000_000_000
 
-# Historical factors, unchanged. They have NOT been refitted after adding
-# component weight traffic and attention costs; calibrated mode is experimental.
+# GPU decode factors, recalibrated after active-weight bytes were corrected to
+# component-wise precision. With those bytes, gpt-oss on L4 and RTX PRO 6000 implies
+# ~0.66-0.74 bandwidth efficiency, the same as dense models, so MoE decode adopts the
+# dense decode factors (0.70 + 0.5 ms). The H100 gpt-oss-20b vLLM result (long context,
+# structured output) is a visible outlier excluded from fitting; no hardware-specific
+# overhead is added for it. Prefill compute factors are unchanged and remain provisional.
 GPU_CALIBRATION = {
     "dense": {"compute": 0.38, "bandwidth": 0.70, "overhead_ms": 0.5},
-    "moe": {"compute": 0.15, "bandwidth": 0.50, "overhead_ms": 2.0},
+    "moe": {"compute": 0.15, "bandwidth": 0.70, "overhead_ms": 0.5},
 }
 
 

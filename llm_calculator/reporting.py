@@ -16,7 +16,7 @@ class PerformanceReporter:
         elif efficiency == 'theoretical':
             print("Estimate mode: theoretical (idealized hardware estimate).")
         else:
-            print("Estimate mode: calibrated (historical factors; not refitted to corrected work estimates).")
+            print("Estimate mode: calibrated (GPU decode factors fitted to public batch-1 measurements; prefill factors provisional).")
         if device == 'cpu':
             print("CPU efficiency factors are unchanged and have not been refitted to corrected work estimates.")
         print("Single-request output rate includes prefill; single-stream decode rate "

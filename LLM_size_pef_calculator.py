@@ -67,9 +67,9 @@ def parse_args() -> argparse.Namespace:
         '--efficiency',
         choices=['theoretical', 'calibrated'], default='theoretical',
         help='GPU efficiency model: theoretical (idealized hardware estimate; '
-             'default for all GPU profiles) or calibrated using historical factors '
-             'not refitted to the corrected formulas. CPU devices always report calibrated '
-             'values, regardless of this option.'
+             'default for all GPU profiles) or calibrated (GPU decode factors fitted to '
+             'public batch-1 measurements; prefill factors provisional). CPU devices '
+             'always report calibrated effective rates, regardless of this option.'
     )
     parser.add_argument('--parallelism', choices=['ideal', 'tensor'], default='ideal',
                         help='ideal: pooled hardware with zero communication; tensor: '
